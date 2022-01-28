@@ -1,0 +1,97 @@
+name: $(BuildDefinitionName)-($(Build.SourceBranchName))-$(Rev:rrr)
+
+trigger:
+  - none
+
+resources:
+  repositories:
+  - repository: self
+    type: git
+    ref: refs/heads/main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+# Read global variables common for Yaml pipelines and Terraform
+# These variables define governance related details (portfolio name, id, etc.) of this solution implementation.
+- template: ../../parameters/globalvariables.yml
+
+stages:
+- stage: TerraformContinuousIntegration
+  displayName: Terraform Module - CI
+  jobs:
+  - job: TerraformContinuousIntegrationJob
+    displayName: TerraformContinuousIntegration - CI Job
+    pool:
+      vmImage: ubuntu-20.04
+    steps:
+    # Step 1: run the Checkov Static Code Analysis
+    - task: Bash@3
+      displayName: Checkov Static Code Analysis
+      inputs:
+        targetType: 'inline'
+        script: |
+          set +e
+          docker run --volume $(System.DefaultWorkingDirectory)/terraform/config:/tf bridgecrew/checkov --directory /tf --output junitxml > $(System.DefaultWorkingDirectory)/Checkov-Report0.xml
+          docker run --volume $(System.DefaultWorkingDirectory)/terraform/modules:/tf bridgecrew/checkov --directory /tf --output junitxml > $(System.DefaultWorkingDirectory)/Checkov-Report1.xml
+          set -e
+      continueOnError: true 
+
+    # Publish test results to Azure Pipelines
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit' # Options: JUnit, NUnit, VSTest, xUnit, cTest
+        testResultsFiles: '**/Checkov-Report*.xml' 
+        searchFolder: '$(System.DefaultWorkingDirectory)' # Optional
+        mergeTestResults: false # Optional
+        #failTaskOnFailedTests: false # Optional
+        testRunTitle: 'Checkov' # Optional
+        #buildPlatform: # Optional
+        #buildConfiguration: # Optional
+        #publishRunAttachments: true # Optional
+
+- template: terraform-stages-template.yml
+  parameters:
+    environment: dev
+    environmentDisplayName: Dev
+    applicationname: $(applicationname)
+    shortapplicationname: $(shortapplicationname)
+    location: $(location)
+    TerraformArguments: >-
+      -var applicationname=$(applicationname)
+      -var environment=dev
+    # For additional security, pass secret through environment instead of command line.
+    # Terraform recognizes TF_VAR prefixed environment variables.
+    TerraformEnvVariables:
+      TF_IN_AUTOMATION: true
+
+- template: terraform-stages-template.yml
+  parameters:
+    environment: test
+    environmentDisplayName: Test
+    applicationname: $(applicationname)
+    shortapplicationname: $(shortapplicationname)
+    location: $(location)
+    TerraformArguments: >-
+      -var applicationname=$(applicationname)
+      -var environment=test
+    # For additional security, pass secret through environment instead of command line.
+    # Terraform recognizes TF_VAR prefixed environment variables.
+    TerraformEnvVariables:
+      TF_IN_AUTOMATION: true
+
+- template: terraform-stages-template.yml
+  parameters:
+    environment: prod
+    environmentDisplayName: Prod
+    applicationname: $(applicationname)
+    shortapplicationname: $(shortapplicationname)
+    location: $(location)
+    TerraformArguments: >-
+      -var applicationname=$(applicationname)
+      -var environment=prod
+    # For additional security, pass secret through environment instead of command line.
+    # Terraform recognizes TF_VAR prefixed environment variables.
+    TerraformEnvVariables:
+      TF_IN_AUTOMATION: true

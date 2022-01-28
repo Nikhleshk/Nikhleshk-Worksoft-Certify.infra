@@ -1,0 +1,216 @@
+parameters:
+  environment: dev
+  environmentDisplayName: Dev
+  applicationname: pcsddemo
+  shortapplicationname: pcsdemo
+  location: westeurope
+  TerraformArguments: ''
+  TerraformEnvVariables: ''
+
+stages:
+- stage: Terraform_Plan_${{ parameters.environment }}
+  displayName: Plan ${{ parameters.environmentDisplayName }}
+  jobs:
+  - job: Terraform_Plan
+    displayName: Plan Terraform
+    # Avoid concurrent Terraform runs on PRs, which would result in failures due to exclusive lock on remote state file.
+    condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), variables['RUN_FLAG_TERRAFORM']))
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - template: init/terraform-init-template.yml
+      parameters:
+        applicationname: ${{ parameters.applicationname }}
+        shortapplicationname: ${{ parameters.shortapplicationname }}
+        environment: ${{ parameters.environment }}
+        provisionStorage: true
+        TerraformDirectory: "$(System.DefaultWorkingDirectory)/terraform/envs/${{ parameters.environment }}"
+        TerraformBackendLocation: ${{ parameters.location }}
+    
+    # If you prefer using environment specific identitied on apply, change Service Connection here
+    - task: AzureCLI@1
+      displayName: Terraform ARM Environment on Service Connection SPN.
+      inputs:
+        azureSubscription: $(SubAzureSubscription)
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -eu
+          export ARM_CLIENT_ID=$servicePrincipalId
+          echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$ARM_CLIENT_ID" 
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET]$ARM_CLIENT_SECRET"
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id | xargs)
+          echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$ARM_SUBSCRIPTION_ID"
+          export ARM_TENANT_ID=$(az account show --query tenantId | xargs)
+          echo "##vso[task.setvariable variable=ARM_TENANT_ID]$ARM_TENANT_ID"         
+        addSpnToEnvironment: true
+
+    # Using bash instead of Terraform extension because of following issues:
+    # - https://github.com/microsoft/azure-pipelines-extensions/issues/748
+    # - https://github.com/microsoft/azure-pipelines-extensions/issues/725
+    # - https://github.com/microsoft/azure-pipelines-extensions/issues/747
+    - bash: |
+        set -eu      
+        az login --service-principal --username $(ARM_CLIENT_ID) --password $(ARM_CLIENT_SECRET) --tenant $(ARM_TENANT_ID)
+        az account set --subscription $(ARM_SUBSCRIPTION_ID)
+  
+        terraform plan -input=false -out=tfplan
+      displayName: Terraform plan
+      workingDirectory: $(System.DefaultWorkingDirectory)/terraform/envs/${{ parameters.environment }} 
+      
+    - bash: |
+        # Save a human-friendly version of the plan with passwords hidden
+        terraform show -no-color tfplan > plan.txt
+        # Remove terraform plan from published artifacts, as it contains clear-text secrets
+        rm tfplan
+        # Resource providers can be > 100MB large, we don't want them in the published artifacts.
+        rm -r .terraform
+      displayName: Save plan text      
+      workingDirectory: $(System.DefaultWorkingDirectory)/terraform/envs/${{ parameters.environment }} 
+    
+    - task: CopyFiles@2
+      displayName: 'Copy Global variables'
+      inputs:
+        SourceFolder: $(System.DefaultWorkingDirectory)/parameters/ 
+        Contents: |
+          *.yml
+        TargetFolder: '$(build.artifactstagingdirectory)/parameters'
+
+    - task: CopyFiles@2
+      displayName: 'Copy Terraform files'
+      inputs:
+        SourceFolder: $(System.DefaultWorkingDirectory)/terraform/ 
+        Contents: |
+          **/${{ parameters.environment }}/*
+          **/config/**
+          **/modules/**
+        TargetFolder: '$(build.artifactstagingdirectory)/terraform'
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish plan artifact
+      inputs:
+        targetPath: $(build.artifactstagingdirectory)
+        artifact: terraform_resources_${{ parameters.environment }}
+
+- stage: Terraform_Apply_${{ parameters.environment }}
+  displayName: Apply ${{ parameters.environmentDisplayName }}  
+  jobs:
+  - job: waitForValidation
+    displayName: Wait for external validation
+    pool: server
+    timeoutInMinutes: 45 # job times out in 45 Minutes
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 45 # task times out in 45 Minutes
+      inputs:
+        notifyUsers: |
+          tommi.wiren@outokumpu.com
+        instructions: 'Please Confirm if you want to proceed with Test Build'
+        onTimeout: 'reject'
+  - deployment: Apply
+    dependsOn: waitForValidation
+    environment: ${{ parameters.environmentDisplayName }}
+    displayName: Apply Terraform
+    condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), variables['RUN_FLAG_TERRAFORM']))
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:        
+        deploy:
+          steps:
+          - download: none
+          - task: DownloadPipelineArtifact@2
+            displayName: Download plan
+            inputs:
+              source: 'current' # Options: current, specific              
+
+          # Terraform Init is done with Subscription level SPN because it is setting up the shared storage account for State.
+          - template: init/terraform-init-template.yml
+            parameters:
+              applicationname: ${{ parameters.applicationname }}
+              shortapplicationname: ${{ parameters.shortapplicationname }}
+              environment: ${{ parameters.environment }}
+              provisionStorage: false
+              TerraformDirectory: "$(Pipeline.Workspace)/terraform_resources_${{ parameters.environment }}/terraform/envs/${{ parameters.environment }}"       
+              TerraformBackendLocation: ${{ parameters.location }}
+          
+          # Init Environment specific Service Connection SPN after Terraform Init
+          - task: AzureCLI@1
+            displayName: Terraform ARM Environment on Service Connection SPN.
+            inputs:
+              azureSubscription: $(SubAzureSubscription)
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -eu
+                export ARM_CLIENT_ID=$servicePrincipalId
+                echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$ARM_CLIENT_ID" 
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET]$ARM_CLIENT_SECRET"
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id | xargs)
+                echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$ARM_SUBSCRIPTION_ID"
+                export ARM_TENANT_ID=$(az account show --query tenantId | xargs)
+                echo "##vso[task.setvariable variable=ARM_TENANT_ID]$ARM_TENANT_ID"             
+              addSpnToEnvironment: true
+              
+          # As the Terraform extension plan task doesn't support -detailed-exitcode
+          # (to check if any changes are present), we define an equivalent bash
+          # task instead.
+          - bash: |
+              set -eu
+              # terraform plan -detailed-exitcode exit codes:
+              # 0 - Succeeded, diff is empty (no changes)
+              # 1 - Errored
+              # 2 - Succeeded, there is a diff
+              # >2 - unexpected, crash or bug
+              #if terraform plan -detailed-exitcode -input=false -out=tfplan -var environment=${{ parameters.environment }} ${{ parameters.TerraformArguments }}; then
+              if terraform plan -detailed-exitcode -input=false -out=tfplan ; then
+                echo "Terraform succeeded with no changes"
+                # NB terraform apply should still be run, e.g. if new outputs have been created
+              else
+                terraform_exitcode=$?
+                if [ $terraform_exitcode -eq 2 ]; then
+                  echo "Terraform succeeded with updates"
+                else
+                  echo "ERROR: terraform exited with code $terraform_exitcode"
+                  exit 1
+                fi
+              fi
+            displayName: Terraform plan
+            workingDirectory: "$(Pipeline.Workspace)/terraform_resources_${{ parameters.environment }}/terraform/envs/${{ parameters.environment }}"
+            env:
+              ${{ parameters.TerraformEnvVariables }}
+
+          - bash: |
+              set -eux  # ensure pipeline stops if terraform fails or diff reports a difference
+              terraform show -no-color tfplan > newplan.txt
+              diff -u plan.txt newplan.txt
+            workingDirectory: "$(Pipeline.Workspace)/terraform_resources_${{ parameters.environment }}/terraform/envs/${{ parameters.environment }}"
+            displayName: Check unchanged plan
+            enabled: false
+
+          - bash: |
+              set -eu
+              terraform apply -input=false -auto-approve tfplan
+            displayName: Terraform apply
+            workingDirectory: "$(Pipeline.Workspace)/terraform_resources_${{ parameters.environment }}/terraform/envs/${{ parameters.environment }}"            
+
+  - job: ReadTerraform
+    dependsOn: Apply
+    condition: always()
+    displayName: Read outputs
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - template: init/terraform-init-template.yml
+      parameters:
+        applicationname: ${{ parameters.applicationname }}
+        shortapplicationname: ${{ parameters.shortapplicationname }}
+        environment: ${{ parameters.environment }}
+        provisionStorage: false
+        TerraformDirectory: $(System.DefaultWorkingDirectory)/terraform/envs/${{ parameters.environment }}
+        TerraformBackendLocation: ${{ parameters.location }}
+
+    - template: init/terraform-outputs-template.yml
+      parameters:
+        TerraformDirectory: $(System.DefaultWorkingDirectory)/terraform/envs/${{ parameters.environment }}

@@ -1,0 +1,105 @@
+parameters: 
+    - name: target
+    - name: buildConfiguration
+    - name: buildPlatform
+          
+stages: 
+- stage: ${{ parameters.target }}
+  displayName: Build and Deploy ${{ parameters.target }} Environment
+  condition: or(and(contains(variables['Build.SourceBranch'], 'refs/heads/feature'), eq('${{ parameters.target }}','dev')),  and(contains(variables['Build.SourceBranch'], 'refs/heads/release'), eq('${{ parameters.target }}','test')),  and(contains(variables['Build.SourceBranch'], 'refs/heads/release'), eq('${{ parameters.target }}','prod')))
+  variables:
+  - name: blockonpossibledataloss
+    value: False
+  - name: generateSmartDefaults
+    value: False
+  - name: dacpacPath
+    value: '$(Pipeline.Workspace)/drop/db/dev/bin/Release/dev.dacpac'
+  - name: environment
+    value: ${{ parameters.target }}
+  - template: '../../../parameters/{{ parameters.target }}variables.yml'
+
+  jobs:  
+  - job: Build${{ parameters.target }}Database
+    displayName: Build database (${{ parameters.target }})
+    pool:
+      vmImage: vs2017-win2016
+    steps:
+    - checkout: self
+    - task: VSBuild@1
+      displayName: Build solution db/db.sln
+      inputs:
+        solution: db/db.sln
+        platform: ${{ parameters.buildPlatform }}
+        configuration: ${{ parameters.buildConfiguration }}
+    - task: CopyFiles@2
+      displayName: 'Copy ${{ parameters.buildConfiguration }} Files to: $(build.artifactstagingdirectory)'
+      inputs:
+        Contents: '**\bin\$(BuildConfiguration)\**'
+        TargetFolder: $(build.artifactstagingdirectory)
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact: ${{ parameters.target }}'
+
+  - deployment: ${{ parameters.target }}Deployment
+    displayName: Deployment on ${{ parameters.target }} Environment
+    environment: ${{ parameters.target }}
+    dependsOn: Build${{ parameters.target }}Database
+    pool:
+      name: 'OBOL Agent Pool'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureKeyVault@2
+            enabled: true
+            inputs:
+              azureSubscription: '${{ variables.azuresubscription}}'
+              #azureSubscription: 'devops-rg-outokumpu-business-object-library-dev-spn for outokumpubusinessobjectlibrary-dev-rg in otk business object library prod'
+              KeyVaultName: 'otk-$(shortapplicationname)-$(environment)-kv'
+              SecretsFilter: '*'
+              RunAsPreJob: true
+          - task: PowerShell@2
+            displayName: 'Generate DB connection string'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ConnectionString = "Server=tcp:$(dbServer).database.windows.net;Initial Catalog=$(dbName);Persist Security Info=False;User ID=$(dbAdmin);Password=$(otk-otkbusobjlib-sqladm);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+                write-host $ConnectionString
+                echo "##vso[task.setvariable variable=connectionString]$ConnectionString"         
+
+          - task: Bash@3
+            enabled: true
+            inputs:
+              targetType: 'inline'
+              script: |                
+                /opt/sqlpackage/sqlpackage /a:DeployReport /tcs:"$CONNECTIONSTRING" /sf:"$DACPACPATH" /OutputPath:”~\DeployReport.xml”
+            displayName: 'Run Deploy Report'
+            continueOnError: true
+            env:             
+              CONNECTIONSTRING: $(connectionString)
+              DACPACPATH: $(dacpacPath)
+
+          - task: Bash@3
+            enabled: true
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Write your commands here
+                echo  $CONNECTIONSTRING
+                echo $DACPACPATH
+                /opt/sqlpackage/sqlpackage /a:Publish /p:BlockOnPossibleDataLoss=$BLOCKONPOSSIBLEDATALOSS /p:GenerateSmartDefaults=$GENERATESMARTDEFAULTS /tcs:"$CONNECTIONSTRING" /sf:"$DACPACPATH" /Diagnostics:false
+            displayName: 'Deploy DACPAC'
+            env:
+              BLOCKONPOSSIBLEDATALOSS: $(blockonpossibledataloss)
+              GENERATESMARTDEFAULTS: $(generateSmartDefaults)
+              CONNECTIONSTRING: $(connectionString)
+              DACPACPATH: $(dacpacPath)
+
+          - task: GitCreatePullRequest@0            
+            condition: and(contains(variables['Build.SourceBranch'], 'refs/heads/release'), eq('${{ parameters.target }}','prod'), succeeded())
+            enabled: true
+            inputs:
+              repositorySelectionMethod: 'currentBuild'
+              sourceBranch: 'self'
+              targetBranch: 'develop'
+              deleteSourceBranch: true
+              squashMerge: true        

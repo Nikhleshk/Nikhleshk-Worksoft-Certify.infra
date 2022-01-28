@@ -1,0 +1,3 @@
+variables:
+  - name: ProdAzureSubscription 
+    value: 'devops-rg-worksoft-certify-prod-spn for worksoftcertify-prod-rg in otk worksoft certify prod'

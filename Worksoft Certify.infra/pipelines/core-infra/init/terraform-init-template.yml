@@ -1,0 +1,110 @@
+parameters:
+  applicationname: pcs-devopsautomation
+  shortapplicationname: pcsdevopsaut
+  environment: stage
+  provisionStorage: false
+  #TerraformVersion: 0.12.21 # Bad idea to have this here.
+  TerraformDirectory:    
+  TerraformBackendLocation: West Europe
+
+steps:
+- task: AzureCLI@1
+  displayName: Set Terraform backend variables  
+  inputs:
+    azureSubscription: $(SubAzureSubscription)
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -eu  # fail on error
+      export RG='${{parameters.applicationname}}-tfstate-rg'
+      echo "##vso[task.setvariable variable=RG]$RG"
+      export AZURE_STORAGE_ACCOUNT='tf${{parameters.shortapplicationname}}statesa'
+      echo "##vso[task.setvariable variable=AZURE_STORAGE_ACCOUNT]$AZURE_STORAGE_ACCOUNT"
+      export TF_STATE_BLOB_CONTAINER_NAME='tf${{parameters.shortapplicationname}}${{parameters.environment}}state'
+      echo "##vso[task.setvariable variable=TF_STATE_BLOB_CONTAINER_NAME]$TF_STATE_BLOB_CONTAINER_NAME"
+      export TF_STATE_BLOB_FILE='${{parameters.shortapplicationname}}.${{parameters.environment}}.tfstate'      
+      echo "##vso[task.setvariable variable=TF_STATE_BLOB_FILE]$TF_STATE_BLOB_FILE" 
+      export ARM_CLIENT_ID=$servicePrincipalId
+      echo "##vso[task.setvariable variable=ARM_CLIENT_ID]$ARM_CLIENT_ID" 
+      export ARM_CLIENT_SECRET=$servicePrincipalKey
+      echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET]$ARM_CLIENT_SECRET"
+      export ARM_SUBSCRIPTION_ID=$(az account show --query id | xargs)
+      echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$ARM_SUBSCRIPTION_ID"
+      export ARM_TENANT_ID=$(az account show --query tenantId | xargs)
+      echo "##vso[task.setvariable variable=ARM_TENANT_ID]$ARM_TENANT_ID"      
+    addSpnToEnvironment: true
+
+
+- task: AzureCLI@1
+  displayName: Set Terraform backend
+  condition: and(succeeded(), ${{ parameters.provisionStorage }})
+  inputs:    
+    azureSubscription: $(SubAzureSubscription)
+    scriptLocation: inlineScript
+    inlineScript: |
+    
+      set -eu  # fail on error
+      # Connect Azure with Level1 identity for init
+      
+      az login --service-principal --username $ARM_CLIENT_ID --password $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID
+      az account set --subscription $ARM_SUBSCRIPTION_ID
+      if ! az group show -n "$RG" -o none 2>/dev/null; then
+          az group create -n "$RG" --tags guid=${{variables.applicationsysid}} environment=prod --location ${{parameters.TerraformBackendLocation}} -o none
+      fi      
+      if ! az storage account show -n "$AZURE_STORAGE_ACCOUNT" -o none 2>/dev/null; then
+          az storage account create -n "$AZURE_STORAGE_ACCOUNT" -g "$RG" --kind StorageV2 --sku Standard_LRS --https-only true --allow-blob-public-access false -o none 
+      fi
+      export AZURE_STORAGE_KEY="$(az storage account keys list -g "$RG" -n "$AZURE_STORAGE_ACCOUNT" --query '[0].value' -o tsv)"
+      echo "AZURE_STORAGE_KEY is: $AZURE_STORAGE_KEY"
+      if test -z "$AZURE_STORAGE_KEY"; then
+        az configure --defaults group="$RG" location='${{ parameters.TerraformBackendLocation }}'      
+      fi      
+      container=$TF_STATE_BLOB_CONTAINER_NAME
+      if ! az storage container show -n "$container" -o none 2>/dev/null; then
+        az storage container create -n "$container" -o none
+      fi
+      blob=$TF_STATE_BLOB_FILE
+      if [[ $(az storage blob exists -c "$container" -n "$blob" --query exists) = "true" ]]; then
+        if [[ $(az storage blob show -c "$container" -n "$blob" --query "properties.lease.status=='locked'") = "true" ]]; then
+          echo "State is leased"
+          lock_jwt=$(az storage blob show -c "$container" -n "$blob" --query metadata.terraformlockid -o tsv)
+          if [ "$lock_jwt" != "" ]; then
+            lock_json=$(base64 -d <<< "$lock_jwt")
+            echo "State is locked"
+            jq . <<< "$lock_json"
+          fi
+          if [ "${TERRAFORM_BREAK_LEASE:-}" != "" ]; then
+            az storage blob lease break -c "$container" -b "$blob"
+          else
+            echo "If you're really sure you want to break the lease, rerun the pipeline with variable TERRAFORM_BREAK_LEASE set to 1."
+            exit 1
+          fi
+        fi
+      fi
+    addSpnToEnvironment: true
+
+#- task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+#  displayName: Install Terraform
+#  inputs:
+#    terraformVersion: ${{ parameters.TerraformVersion }}
+
+# Using bash instead of Terraform extension because of following issue:
+# - https://github.com/microsoft/azure-pipelines-extensions/issues/738
+- task: AzureCLI@1
+  displayName: Terraform init
+  inputs:
+    azureSubscription: $(SubAzureSubscription)
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -eux  # fail on error
+      echo "ARM_SUBSCRIPTION_ID is: $ARM_SUBSCRIPTION_ID"
+      terraform init \
+        -backend-config=storage_account_name=$AZURE_STORAGE_ACCOUNT \
+        -backend-config=container_name=$TF_STATE_BLOB_CONTAINER_NAME \
+        -backend-config=key=$TF_STATE_BLOB_FILE \
+        -backend-config=resource_group_name=$RG \
+        -backend-config=subscription_id=$ARM_SUBSCRIPTION_ID \
+        -backend-config=tenant_id=$ARM_TENANT_ID \
+        -backend-config=client_id=$ARM_CLIENT_ID \
+        -backend-config=client_secret="$ARM_CLIENT_SECRET"
+    workingDirectory: ${{ parameters.TerraformDirectory }}
+    addSpnToEnvironment: true

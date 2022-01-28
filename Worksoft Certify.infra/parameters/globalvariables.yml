@@ -1,0 +1,23 @@
+variables:
+  - name: fullapplicationname 
+    value: 'Worksoft Certify'
+  - name: applicationname 
+    value: 'worksoftcertify'
+  - name: shortapplicationname 
+    value: 'workcert' 
+  - name: releaseprocess 
+    value: 'standardthree' 
+  - name: SubAzureSubscription 
+    value: 'devops-sub-worksoft-certify-prod-spn for OTK Worksoft Certify Prod'
+  - name: location 
+    value: 'westeurope'
+  - name: shortregion 
+    value: 'weu'
+  - name: onboarddetailsid 
+    value: '167'
+  - name: applicationsysid 
+    value: '68b77051db59b2004101f3d31d9619d2'
+  - name: projectnumber 
+    value: 'na'
+  - name: VisualStudioBenefits 
+    value: 'false'

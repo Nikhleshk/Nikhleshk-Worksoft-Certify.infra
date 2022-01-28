@@ -1,0 +1,3 @@
+variables:
+  - name: DevAzureSubscription 
+    value: 'devops-rg-worksoft-certify-dev-spn for worksoftcertify-dev-rg in otk worksoft certify prod'
